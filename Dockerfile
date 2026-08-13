@@ -47,4 +47,7 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD python -c "import intervals_icu_mcp; print('ok')" || exit 1
 
 # Run the MCP server
-ENTRYPOINT ["python", "-m", "intervals_icu_mcp.server"]
+# ENTRYPOINT ["python", "-m", "intervals_icu_mcp.server"]
+
+# Run the MCP server
+ENTRYPOINT ["sh", "-c", "python -m intervals_icu_mcp.server --transport http --host 0.0.0.0 --port ${PORT:-8000} --path ${MCP_PATH:-/mcp}"]
