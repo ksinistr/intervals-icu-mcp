@@ -92,9 +92,25 @@ VALID_CATEGORIES = {
 CATEGORY_ALIASES = {"RACE": "RACE_A", "GOAL": "TARGET"}
 VALID_AVAILABILITY = {"NORMAL", "LIMITED", "UNAVAILABLE"}
 RACE_CATEGORIES = {"RACE_A", "RACE_B", "RACE_C"}
-# Canonical Intervals.icu activity disciplines accepted by the API for the
-# `type` field. Must match models.ActivityType.
-ACTIVITY_TYPES_HINT = "Ride, Run, Swim, Walk, Hike, VirtualRide, VirtualRun, Other"
+# Common activity disciplines surfaced in parameter hints and error messages —
+# a curated subset of the full enum (models.ACTIVITY_DISCIPLINES). The complete
+# list is published in the intervals-icu://event-categories resource;
+# tests/test_activity_disciplines.py guards subset membership.
+COMMON_ACTIVITY_TYPES = (
+    "Ride",
+    "Run",
+    "Swim",
+    "Walk",
+    "Hike",
+    "WeightTraining",
+    "Workout",
+    "VirtualRide",
+    "VirtualRun",
+    "Other",
+)
+ACTIVITY_TYPES_HINT = ", ".join(COMMON_ACTIVITY_TYPES) + (
+    " (full discipline list: intervals-icu://event-categories resource)"
+)
 
 # Compact, in-context workout-syntax cheat-sheet for the `description` field.
 # Inlined (not only pointed at via the intervals-icu://workout-syntax resource)
@@ -187,18 +203,30 @@ def _swim_work_lacks_intensity(steps: list[Any]) -> bool:
 
 
 def _workout_parse_info(event: Event) -> dict[str, Any] | None:
-    """Echo whether a WORKOUT `description` parsed into a structured workout.
+    """Parse signal for a calendar event; None for non-WORKOUT categories."""
+    if event.category != "WORKOUT":
+        return None
+    return workout_doc_parse_info(event.description, event.workout_doc, event.type)
+
+
+def workout_doc_parse_info(
+    description: str | None,
+    workout_doc: dict[str, Any] | None,
+    sport_type: str | None,
+) -> dict[str, Any] | None:
+    """Echo whether a workout `description` parsed into a structured workout.
 
     Intervals.icu always returns a workout_doc object, but its `steps` list is
     empty when the description could not be parsed (prose, or a non-native format
     a model invented). Surfacing this lets the caller tell a real structured
     workout — one that syncs to devices and gets a computed load — from free text
-    stored verbatim, instead of a silent "success". Returns None for non-WORKOUT
-    events or WORKOUT events with no description (nothing to parse).
+    stored verbatim, instead of a silent "success". Shared by WORKOUT calendar
+    events and library workouts, which parse the same syntax. Returns None when
+    there is no description (nothing to parse).
     """
-    if event.category != "WORKOUT" or not event.description:
+    if not description:
         return None
-    doc: dict[str, Any] = event.workout_doc or {}
+    doc: dict[str, Any] = workout_doc or {}
     steps: list[Any] = doc.get("steps") or []
     if steps:
         info: dict[str, Any] = {
@@ -210,7 +238,7 @@ def _workout_parse_info(event: Event) -> dict[str, Any] | None:
         # targets load fine off swim FTHR. Key on whether the *work* steps carry an
         # intensity target rather than on total load — a warmup pace zone or a stray
         # misapplied zone can leave a token load on an otherwise intensity-less set.
-        if event.type == "Swim" and _swim_work_lacks_intensity(steps):
+        if sport_type == "Swim" and _swim_work_lacks_intensity(steps):
             info["workout_load_hint"] = (
                 "Swim parsed but its work steps have no recognized pace or HR target, "
                 "so it gets no meaningful training load. Common causes: the words "
@@ -312,8 +340,8 @@ async def create_event(
     ] = None,
     event_type: Annotated[
         str | None,
-        "Activity discipline (NOT the category): Ride, Run, Swim, Walk, Hike, "
-        "VirtualRide, VirtualRun, Other. Required for RACE_A/B/C events.",
+        "Activity discipline (NOT the category): " + ACTIVITY_TYPES_HINT + ". "
+        "Required for RACE_A/B/C events.",
     ] = None,
     duration_seconds: Annotated[int | None, "Planned duration in seconds"] = None,
     distance_meters: Annotated[float | None, "Planned distance in meters"] = None,
@@ -599,13 +627,29 @@ async def delete_event(
         )
 
 
+# icu_create_event's parameter names -> Intervals.icu API field names. Bulk takes the
+# same vocabulary as the singular tool and as every event response (#5.0.0 unification).
+_BULK_FIELD_MAP = {
+    "event_type": "type",
+    "duration_seconds": "moving_time",
+    "distance_meters": "distance",
+    "training_load": "icu_training_load",
+}
+
+# Raw API names accepted before 5.0.0. They are rejected rather than ignored: every one
+# of them would otherwise pass straight through to the API and keep working, leaving two
+# undocumented vocabularies alive. A named error tells the caller exactly what to change.
+_BULK_RENAMED_FIELDS = {api: friendly for friendly, api in _BULK_FIELD_MAP.items()}
+
+
 async def bulk_create_events(
     events: Annotated[
         str,
-        "JSON array of event objects. Required per event: start_date_local, "
-        "name, category. Optional: description, event_type (activity discipline "
-        "Ride/Run/Swim/…; raw `type` also accepted), moving_time, distance, "
-        "icu_training_load, end_date_local, training_availability, color, "
+        "JSON array of event objects, each shaped exactly like an icu_create_event "
+        "call. Required per event: start_date_local, name, category. Optional: "
+        "description, event_type (activity discipline Ride/Run/Swim/…), "
+        "duration_seconds, distance_meters, training_load, "
+        "end_date_local, training_availability, color, "
         "show_as_note, not_on_fitness_chart, show_on_ctl_line. See "
         "intervals-icu://event-categories for the category enum. " + WORKOUT_SYNTAX_HINT,
     ],
@@ -664,11 +708,23 @@ async def bulk_create_events(
                 )
             event_data["category"] = normalized_category
 
-            # Accept `event_type` (the icu_create_event / icu_update_event parameter
-            # name) as an alias for the API's `type` field, so bulk payloads can mirror
-            # the singular tools. Raw `type` still works and wins if both are present.
-            if "event_type" in event_data:
-                event_data.setdefault("type", event_data.pop("event_type"))
+            # Bulk payloads use the same vocabulary as icu_create_event and as every
+            # event response. Translate to the API's field names here. The raw names
+            # (type, moving_time, distance, icu_training_load) were accepted until
+            # 5.0.0; they silently dropped whenever a model reused the singular
+            # interface, which is why the schemes were unified.
+            removed = [f for f in _BULK_RENAMED_FIELDS if f in event_data]
+            if removed:
+                renames = ", ".join(f"{f} -> {_BULK_RENAMED_FIELDS[f]}" for f in removed)
+                return ResponseBuilder.build_error_response(
+                    f"Event {i}: raw Intervals.icu field name(s) {', '.join(removed)} are no "
+                    f"longer accepted. Bulk payloads use the same names as icu_create_event: "
+                    f"{renames}.",
+                    error_type="validation_error",
+                )
+            for friendly, api_field in _BULK_FIELD_MAP.items():
+                if friendly in event_data:
+                    event_data[api_field] = event_data.pop(friendly)
 
             if normalized_category in RACE_CATEGORIES and not event_data.get("type"):
                 return ResponseBuilder.build_error_response(

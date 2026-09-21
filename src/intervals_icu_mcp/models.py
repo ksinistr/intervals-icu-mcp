@@ -1,12 +1,81 @@
 """Pydantic models for Intervals.icu API responses."""
 
+import math
 from datetime import datetime
-from typing import Any, Literal, cast
+from typing import Any, Literal, cast, get_args
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # Type aliases for common enums
-ActivityType = Literal["Ride", "Run", "Swim", "Walk", "Hike", "VirtualRide", "VirtualRun", "Other"]
+# Full Intervals.icu activity discipline enum for the `type` field, mirrored
+# from openapi-spec.json (the import-workout `type` parameter enum — the events
+# endpoint validates against the same set, rejecting unknown values with 422
+# "Invalid type"; live-verified). tests/test_activity_disciplines.py keeps this
+# mirror in sync as the weekly spec update lands.
+ActivityType = Literal[
+    "Ride",
+    "Run",
+    "Swim",
+    "WeightTraining",
+    "Hike",
+    "Walk",
+    "AlpineSki",
+    "BackcountrySki",
+    "Badminton",
+    "Canoeing",
+    "Crossfit",
+    "EBikeRide",
+    "EMountainBikeRide",
+    "Elliptical",
+    "Golf",
+    "GravelRide",
+    "TrackRide",
+    "Handcycle",
+    "HighIntensityIntervalTraining",
+    "Hockey",
+    "IceSkate",
+    "InlineSkate",
+    "Kayaking",
+    "Kitesurf",
+    "MountainBikeRide",
+    "Cyclocross",
+    "NordicSki",
+    "OpenWaterSwim",
+    "Padel",
+    "Pilates",
+    "Pickleball",
+    "Racquetball",
+    "Rugby",
+    "RockClimbing",
+    "RollerSki",
+    "Rowing",
+    "Sail",
+    "Skateboard",
+    "Snowboard",
+    "Snowshoe",
+    "Soccer",
+    "Squash",
+    "StairStepper",
+    "StandUpPaddling",
+    "Surfing",
+    "TableTennis",
+    "Tennis",
+    "TrailRun",
+    "Transition",
+    "Velomobile",
+    "VirtualRide",
+    "VirtualRow",
+    "VirtualRun",
+    "VirtualSki",
+    "WaterSport",
+    "Wheelchair",
+    "Windsurf",
+    "Workout",
+    "Yoga",
+    "Other",
+]
+# Runtime view of ActivityType, for rendering hints and resources.
+ACTIVITY_DISCIPLINES: tuple[str, ...] = get_args(ActivityType)
 EventCategory = Literal[
     "WORKOUT",
     "NOTE",
@@ -40,11 +109,47 @@ class SportSettings(BaseModel):
 
     id: int
     type: str | None = None
+
+    # Default workout timings (seconds)
+    warmup_time: int | None = None
+    cooldown_time: int | None = None
+
+    # Power
     ftp: int | None = None
     indoor_ftp: int | None = None
+    power_zones: list[int] = Field(default_factory=list[int])
+    power_zone_names: list[str] = Field(default_factory=list[str])
+    sweet_spot_min: int | None = None
+    sweet_spot_max: int | None = None
+
+    # Heart rate
     fthr: int | None = None
+    max_hr: int | None = None
+    hr_zones: list[int] = Field(default_factory=list[int])
+    hr_zone_names: list[str] = Field(default_factory=list[str])
+    hr_load_type: str | None = None
+    hrrc_min_percent: float | None = None
+
+    # Pace
     pace_threshold: float | None = None
     swim_threshold: float | None = None
+    pace_zones: list[float] = Field(default_factory=list[float])
+    pace_zone_names: list[str] = Field(default_factory=list[str])
+
+    @field_validator(
+        "power_zones",
+        "power_zone_names",
+        "hr_zones",
+        "hr_zone_names",
+        "pace_zones",
+        "pace_zone_names",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_zone_lists(cls, v: Any) -> list[Any]:
+        # The API sends null (not []) for zone sets a sport doesn't use — e.g. a Run
+        # record carries power_zones: null.
+        return v or []
 
     @model_validator(mode="before")
     @classmethod
@@ -169,13 +274,50 @@ class Activity(ActivitySummary):
     hrss: float | None = None
     trimp: float | None = None
     feel: int | None = None
-    perceived_exertion: int | None = None
+    # Intervals.icu stores the athlete-entered RPE in `icu_rpe` (int 1-10).
+    # `perceived_exertion` is the Strava-imported mirror of the same rating and
+    # is a float in the API spec, so it is only read as a fallback — otherwise a
+    # fractional import would shadow the native value. `_resolve_rpe` below does
+    # the actual falling back; the alias order only covers a response that omits
+    # `icu_rpe` entirely.
+    perceived_exertion: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("icu_rpe", "perceived_exertion"),
+    )
     compliance: float | None = None
     avg_lr_balance: float | None = None
     commute: bool | None = None
     trainer: bool | None = None
     indoor: bool | None = None
     analyzed: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _resolve_rpe(cls, data: Any) -> Any:
+        """Fall back to the Strava-imported RPE when the native one is null.
+
+        The API always sends `icu_rpe`, explicitly null when the athlete has not
+        entered an RPE, and `AliasChoices` resolves on key presence rather than
+        null-ness — so on its own the fallback would never fire in production.
+        """
+        if not isinstance(data, dict):
+            return data
+
+        raw = cast(dict[str, Any], data)
+        if raw.get("icu_rpe") is None and raw.get("perceived_exertion") is not None:
+            resolved: dict[str, Any] = dict(raw)
+            resolved["icu_rpe"] = resolved["perceived_exertion"]
+            return resolved
+        return raw
+
+    @field_validator("perceived_exertion", mode="before")
+    @classmethod
+    def _round_perceived_exertion(cls, v: Any) -> Any:
+        """RPE is a whole number on the 1-10 scale, but `perceived_exertion` is
+        typed float by the API. Round rather than fail the whole activity."""
+        if isinstance(v, float):
+            return math.floor(v + 0.5) if math.isfinite(v) else None
+        return v
 
 
 class ActivitySearchResult(BaseModel):
@@ -330,6 +472,11 @@ class Workout(BaseModel):
     indoor: bool | None = None
     color: str | None = None
     type: str | None = None
+    day: int | None = None  # Day offset within a PLAN folder
+    target: str | None = None
+    tags: list[str] | None = None
+    # Parsed structured-workout doc; `steps` is empty when the description did not parse.
+    workout_doc: dict[str, Any] | None = None
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -339,6 +486,7 @@ class Folder(BaseModel):
 
     id: int
     athlete_id: str | None = Field(None, alias="athlete_id")
+    type: str | None = None  # FOLDER or PLAN
     name: str | None = None
     description: str | None = None
     num_workouts: int | None = Field(None, alias="num_workouts")

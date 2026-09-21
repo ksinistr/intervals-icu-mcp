@@ -4,7 +4,7 @@ This file provides guidance to Claude Code when working with this repository.
 
 ## Project Overview
 
-MCP (Model Context Protocol) server for Intervals.icu — provides up to 62 tools, 4 resources, and 9 prompts for accessing training data, wellness metrics, and performance analysis through Claude and other LLMs. The default `INTERVALS_ICU_DELETE_MODE=safe` registers 59 tools; `full` registers all 62, `none` registers 56.
+MCP (Model Context Protocol) server for Intervals.icu — provides up to 67 tools, 4 resources, and 9 prompts for accessing training data, wellness metrics, and performance analysis through Claude and other LLMs. The default `INTERVALS_ICU_DELETE_MODE=safe` registers 64 tools; `full` registers all 67, `none` registers 60.
 
 - **Language**: Python 3.11+
 - **Framework**: FastMCP
@@ -54,7 +54,7 @@ make docker/run       # Run Docker container
 7. `event_management.py` — Create/update/delete events
 8. `performance.py` — Power/HR/pace curves
 9. `curves.py` — HR and pace curve analysis
-10. `workout_library.py` — Browse workout folders and plans
+10. `workout_library.py` — Browse and create folders and plans; create/update/delete library workouts
 11. `gear.py` — Manage gear and reminders
 12. `sport_settings.py` — FTP, FTHR, pace thresholds
 13. `custom_items.py` — Charts, custom fields, zones, etc.
@@ -130,8 +130,7 @@ Follow SemVer with the narrowed contract defined in the CHANGELOG header. **Majo
 
 Running list of deferred breaking cleanups (do together in the next major; keep this list current as more are found):
 
-- **Unify create vs. bulk field names.** `icu_create_event` exposes friendly params (`event_type`, `duration_seconds`, `distance_meters`, `training_load`); `icu_bulk_create_events` takes the raw API names in its JSON (`type`, `moving_time`, `distance`, `icu_training_load`). Bulk now accepts `event_type` as a non-breaking alias, but the others still silently drop when a model reuses the singular interface. Non-breaking interim: add the remaining aliases to bulk. Breaking cleanup to batch: settle on one naming scheme across both tools and drop the aliases.
-- **Drop the no-op gear params.** `icu_create_gear` / `icu_update_gear` accept `brand`, `model`, and `primary`, but the Intervals.icu API has no such fields on gear — they were invented alongside the #110 field-name bugs. They are kept as accepted-but-ignored (with a response warning) to avoid breaking callers; remove all three in the next major.
+- Rename `icu_get_upcoming_workouts` → `icu_get_upcoming_workout_events`, and its response key `workouts` → `events`. The tool returns dated **calendar events** of category `WORKOUT`, but its name reads as workout-library content, and the collision got sharper once the library gained `icu_create_workout` / `icu_update_workout` / `icu_delete_workout` (which take a library `workout_id`, not the event ID this tool returns). The description was sharpened in #132 as the non-breaking stopgap; the rename itself needs a major.
 
 ## Important Files
 
